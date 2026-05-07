@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: health-api
+  namespace: ex33
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  selector:
+    app: health-api
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

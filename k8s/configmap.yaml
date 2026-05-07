@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: ex33
+data:
+  COMPUTE_TYPE: "eks"
+  PORT: "8080"
+  LOG_LEVEL: "info"
