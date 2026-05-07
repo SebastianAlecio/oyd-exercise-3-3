@@ -1,15 +1,15 @@
 # oyd-exercise-3-3 — Módulo EKS
 
-Contraparte EKS de las demos en clase de *Optimizaciones y Desempeño — Cloud Deployment Automation* (sesión 3, 2026-05-07). Provisiona un cluster Amazon EKS mínimo con el módulo Terraform de la comunidad, despliega una API Python `/health` + `/echo` sobre nodos arm64 y la expone vía un NLB.
+Contraparte EKS de las demos de clase del curso *Optimizaciones y Desempeño — Cloud Deployment Automation* (sesión 3, 2026-05-07). El repo provisiona un cluster Amazon EKS mínimo con el módulo Terraform de la comunidad, despliega una API Python (`/health`, `/echo`) sobre nodos arm64 y la expone vía un Network Load Balancer.
 
 ## Contrato de la aplicación
 
-| Método | Ruta     | Respuesta                                                            |
-|--------|----------|----------------------------------------------------------------------|
-| GET    | `/health`| `{"status":"ok","compute":"eks"}`                                    |
-| POST   | `/echo`  | el JSON del body con `"compute":"eks"` agregado                      |
+| Método | Ruta     | Respuesta                                                           |
+|--------|----------|---------------------------------------------------------------------|
+| GET    | `/health`| `{"status":"ok","compute":"eks"}`                                   |
+| POST   | `/echo`  | el JSON del body con `"compute":"eks"` agregado                     |
 
-Código: [`app/app.py`](app/app.py) — `http.server` raw, sin framework. Imagen: `atreality/ex33-health-api:1.0.0` (arm64, Docker Hub).
+La app está en [`app/app.py`](app/app.py) — `http.server` raw, sin framework. La imagen publicada es `atreality/ex33-health-api:1.0.0` (arm64, Docker Hub).
 
 ## Estructura del repositorio
 
@@ -19,36 +19,24 @@ Código: [`app/app.py`](app/app.py) — `http.server` raw, sin framework. Imagen
 ├── infra/
 │   ├── provider.tf
 │   ├── variables.tf
-│   ├── main.tf                # data sources + llamada al módulo
+│   ├── main.tf                # data sources de la VPC default + llamada al módulo
 │   ├── outputs.tf
-│   ├── envs/dev/dev.tfvars    # valores para el entorno dev
-│   └── modules/eks_cluster/   # wrapper reutilizable de terraform-aws-modules/eks/aws ~> 20.0
+│   ├── envs/dev/dev.tfvars    # valores del entorno dev (us-west-2, t4g.small, 1/2/1)
+│   └── modules/eks_cluster/   # wrapper de terraform-aws-modules/eks/aws ~> 20.0
 ├── k8s/                       # namespace, configmap, deployment, service
-└── evidence/                  # screenshots y output de los curl
+└── evidence/                  # screenshot y output de los curl
 ```
 
-## Prerrequisitos
+## Ciclo de vida de la infraestructura
 
-- AWS CLI v2 con credenciales que puedan crear EKS, IAM y EC2
-- Terraform CLI ≥ 1.8
-- `kubectl`
-- Docker Desktop corriendo (con `buildx`)
-- Cuenta de Docker Hub (u otro registry público); login hecho con `docker login`
-
-## Cómo ejecutar
-
-### 1. Provisionar el cluster
+Provisión y verificación:
 
 ```bash
 cd infra/
 terraform init
 terraform plan  -var-file=envs/dev/dev.tfvars
-terraform apply -var-file=envs/dev/dev.tfvars     # ~12-18 min
-```
+terraform apply -var-file=envs/dev/dev.tfvars
 
-### 2. Actualizar kubeconfig y verificar
-
-```bash
 aws eks update-kubeconfig \
   --region us-west-2 \
   --name $(terraform -chdir=infra output -raw cluster_name)
@@ -56,42 +44,29 @@ aws eks update-kubeconfig \
 kubectl get nodes -o wide
 ```
 
-Al menos un nodo debe aparecer en `STATUS=Ready` antes de continuar.
-
-### 3. Construir y publicar la imagen (arm64 para que coincida con los nodos `t4g.small`)
+Build y publicación de la imagen arm64 (compatible con los nodos `t4g.small`):
 
 ```bash
-docker login
-
-# En Apple Silicon esto produce la imagen arm64 correcta.
-# En hardware Intel hay que correr antes `docker buildx create --use`.
 docker buildx build --platform linux/arm64 \
   -t atreality/ex33-health-api:1.0.0 \
   --push app/
 ```
 
-### 4. Desplegar y verificar la aplicación
+Despliegue y prueba de los endpoints:
 
 ```bash
 kubectl apply -f k8s/
-kubectl get pods -n ex33 -w        # esperar 2/2 Running
-kubectl get svc  -n ex33           # esperar a que el EXTERNAL-IP se llene (~2-3 min)
 
 NLB=$(kubectl get svc health-api -n ex33 \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
 curl http://${NLB}/health
-# {"status":"ok","compute":"eks"}
-
 curl -X POST http://${NLB}/echo \
   -H "Content-Type: application/json" \
   -d '{"message":"hello"}'
-# {"compute":"eks","message":"hello"}
 ```
 
-### 5. Destruir todo (para evitar costos)
-
-Hay que borrar los Services tipo LoadBalancer **antes** de `terraform destroy`. Terraform no es dueño del NLB que creó el Service controller — si lo dejas activo, el teardown del VPC se puede colgar.
+Limpieza (los manifests de Kubernetes se borran primero para que el NLB se quite antes del teardown del VPC):
 
 ```bash
 kubectl delete -f k8s/
@@ -99,15 +74,15 @@ cd infra/
 terraform destroy -var-file=envs/dev/dev.tfvars
 ```
 
-## Módulo — tres ajustes que no son opcionales
+## Parámetros explícitos del módulo
 
-El módulo en `infra/modules/eks_cluster/main.tf` define explícitamente tres parámetros:
+El módulo en `infra/modules/eks_cluster/main.tf` define tres parámetros que el ejercicio marca como críticos:
 
-| Parámetro | Por qué |
+| Parámetro | Razón |
 |---|---|
-| `enable_cluster_creator_admin_permissions = true` | Sin esto, la identidad IAM que corrió `apply` no puede usar `kubectl` (cada llamada devuelve `403`). |
-| `cluster_upgrade_policy = { support_type = "STANDARD" }` | Fija el cluster a la ventana de soporte estándar para que no arranque automáticamente la facturación de soporte extendido de EKS. |
-| `ami_type = "AL2023_ARM_64_STANDARD"` (en el node group) | Requerido para instancias `t4g`. Con la AMI x86_64 por defecto el binario de kubelet falla con `exec format error`. |
+| `enable_cluster_creator_admin_permissions = true` | Da acceso vía `kubectl` al IAM principal que corrió el `apply`. Sin esto, todas las llamadas devuelven `403`. |
+| `cluster_upgrade_policy = { support_type = "STANDARD" }` | Mantiene el cluster en la ventana de soporte estándar y evita que arranque la facturación de soporte extendido de EKS. |
+| `ami_type = "AL2023_ARM_64_STANDARD"` (en el node group) | AMI arm64, requerida para los nodos `t4g`. Con la AMI x86_64 por defecto el kubelet falla con `exec format error`. |
 
 ## Evidencia
 
@@ -117,7 +92,7 @@ El módulo en `infra/modules/eks_cluster/main.tf` define explícitamente tres pa
 
 ### Pruebas de los endpoints
 
-Output crudo en [`evidence/curl-output.txt`](evidence/curl-output.txt):
+Output guardado en [`evidence/curl-output.txt`](evidence/curl-output.txt):
 
 ```
 === GET /health ===
